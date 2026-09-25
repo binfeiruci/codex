@@ -2081,6 +2081,33 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn apply_shell_completion(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        completed: &str,
+        completed_cursor: usize,
+        menu: Vec<crate::shell_completion::ShellMenuLine>,
+    ) {
+        if self
+            .composer
+            .apply_shell_completion(text, cursor, completed, completed_cursor, menu)
+        {
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn apply_shell_preview(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        preview: crate::shell_completion::ShellPreview,
+    ) {
+        if self.composer.apply_shell_preview(text, cursor, preview) {
+            self.request_redraw();
+        }
+    }
+
     pub(crate) fn attach_image(&mut self, path: PathBuf) {
         if !self.has_active_view() {
             self.composer.attach_image(path);

@@ -3,6 +3,40 @@ use crate::bottom_pane::textarea::TextArea;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn shell_completion_popup_snapshot() {
+    let popup = ShellCompletionPopup {
+        text: "!echo".to_string(),
+        cursor: 5,
+        lines: vec![ShellMenuLine {
+            text: "echo  echotc  echoti".to_string(),
+            selected_cells: Some(6..12),
+        }],
+    };
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 3)).expect("terminal");
+    terminal
+        .draw(|frame| popup.render_menu(frame.area(), frame.buffer_mut()))
+        .expect("draw popup");
+    insta::assert_snapshot!("shell_completion_popup", terminal.backend());
+    let selected_style = crate::style::selection_style();
+    let selected_cells = (1_u16..39)
+        .map(|x| {
+            if terminal
+                .backend()
+                .buffer()
+                .cell((x, 1))
+                .is_some_and(|cell| cell.style() == selected_style)
+            {
+                '#'
+            } else {
+                '.'
+            }
+        })
+        .collect::<String>();
+    insta::assert_snapshot!("shell_completion_selected_cells", selected_cells);
+}
+
+#[test]
 fn dismissed_tokens_after_adjacent_elements_are_occurrence_scoped() {
     let first_bound = "$bound1";
     let second_bound = "$bound2";

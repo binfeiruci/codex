@@ -46,6 +46,10 @@ impl ChatWidget {
             QueueDrain::Continue
         } else {
             self.submit_op(AppCommand::run_user_shell_command(cmd.to_string()));
+            self.app_event_tx.send(AppEvent::RecordShellHistory {
+                command: cmd.to_string(),
+                cwd: self.config.cwd.to_path_buf(),
+            });
             QueueDrain::Stop
         }
     }

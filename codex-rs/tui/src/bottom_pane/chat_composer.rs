@@ -13,6 +13,9 @@
 //!
 //! The plain-text preset keeps command prefixes literal, including `!`, so Enter and Tab
 //! submit ordinary text without enabling shell mode.
+//! In shell mode, Tab asks the current interactive shell to complete the line. Composer edits
+//! request a zsh plugin snapshot; the matching result paints syntax regions and a trailing
+//! autosuggestion. Right or End accepts the plugin's suggestion at the end of the line.
 //!
 //! # Mention Menus
 //!
@@ -39,6 +42,8 @@
 //! Warning and transcript views hide suggestions without losing the draft, query, or selection.
 //! Measurement, painting, and cursor placement share that layout, including clipped views.
 //! Unified mention tabs retain their position across filters; Left/Right also works at a bare `@`.
+//! For `!` commands, the completion popup shows the current shell's menu and highlights the
+//! candidate selected by that shell as Tab cycles through it.
 //!
 //! Popup targeting resolves an editable token range around the cursor and treats atomic text
 //! elements as hard boundaries. When that range begins immediately after an atomic element, the
@@ -398,6 +403,7 @@ use self::history_search::HistorySearchSession;
 use self::popup_state::ActivePopup;
 use self::popup_state::DismissedToken;
 use self::popup_state::PopupState;
+use self::popup_state::ShellCompletionPopup;
 use self::slash_input::SlashInput;
 use self::slash_input::SlashValidation;
 use self::slash_input::SubmissionValidation;
@@ -593,6 +599,9 @@ impl ChatComposerConfig {
 
 pub(crate) struct ChatComposer {
     draft: DraftState,
+    shell_preview: Option<ShellPreviewState>,
+    last_shell_preview_request: Option<(String, usize)>,
+    shell_completion_generation: u64,
     popups: PopupState,
     app_event_tx: AppEventSender,
     history: ChatComposerHistory,
@@ -644,6 +653,55 @@ pub(crate) struct ChatComposer {
     history_search_next_keys: Vec<KeyBinding>,
     editor_keymap: Arc<EditorKeymap>,
     vim_normal_keymap: VimNormalKeymap,
+}
+
+struct ShellPreviewState {
+    text: String,
+    cursor: usize,
+    preview: crate::shell_completion::ShellPreview,
+    /// Composite line whose current highlights should survive the next matching shell response.
+    preserve_highlights_for: Option<String>,
+}
+
+fn shell_highlight_style(spec: &str) -> Style {
+    let mut style = Style::default();
+    for token in spec.split(',').map(str::trim) {
+        if let Some(color) = token.strip_prefix("fg=").and_then(shell_highlight_color) {
+            style = style.fg(color);
+        } else if let Some(color) = token.strip_prefix("bg=").and_then(shell_highlight_color) {
+            style = style.bg(color);
+        } else {
+            style = match token {
+                "bold" => style.add_modifier(Modifier::BOLD),
+                "underline" => style.add_modifier(Modifier::UNDERLINED),
+                "standout" | "reverse" => style.add_modifier(Modifier::REVERSED),
+                "italic" => style.add_modifier(Modifier::ITALIC),
+                _ => style,
+            };
+        }
+    }
+    style
+}
+
+// Preserve the colors chosen by the user's zsh plugins, including indexed and RGB colors.
+#[allow(clippy::disallowed_methods)]
+fn shell_highlight_color(value: &str) -> Option<Color> {
+    match value {
+        "black" => Some(Color::Black),
+        "red" => Some(Color::Red),
+        "green" => Some(Color::Green),
+        "yellow" => Some(Color::Yellow),
+        "blue" => Some(Color::Blue),
+        "magenta" => Some(Color::Magenta),
+        "cyan" => Some(Color::Cyan),
+        "white" => Some(Color::White),
+        "default" => Some(Color::Reset),
+        _ if value.starts_with('#') && value.len() == 7 => {
+            let rgb = u32::from_str_radix(&value[1..], 16).ok()?;
+            Some(Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8))
+        }
+        _ => value.parse::<u8>().ok().map(Color::Indexed),
+    }
 }
 
 /// A resolved legacy `$` target plus any catalog built while disambiguating shell syntax.
@@ -724,6 +782,9 @@ impl ChatComposer {
 
         let mut this = Self {
             draft: DraftState::new(),
+            shell_preview: None,
+            last_shell_preview_request: None,
+            shell_completion_generation: 0,
             popups: PopupState::default(),
             app_event_tx,
             history: ChatComposerHistory::new(),
@@ -1732,6 +1793,255 @@ impl ChatComposer {
         }
     }
 
+    pub(crate) fn apply_shell_completion(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        completed: &str,
+        completed_cursor: usize,
+        menu: Vec<crate::shell_completion::ShellMenuLine>,
+    ) -> bool {
+        if self.current_text() != text
+            || self.current_cursor() != cursor
+            || !completed.starts_with('!')
+            || completed_cursor > completed.len()
+            || !completed.is_char_boundary(completed_cursor)
+            || self.draft.textarea.text_element_ranges().next().is_some()
+        {
+            return false;
+        }
+        let replacement = if self.draft.is_bash_mode {
+            &completed[1..]
+        } else {
+            completed
+        };
+        let previous_len = self.draft.textarea.text().len();
+        self.draft
+            .textarea
+            .replace_range(0..previous_len, replacement);
+        self.set_current_cursor(completed_cursor);
+        self.sync_popups();
+        if !menu.is_empty() {
+            self.popups.active = ActivePopup::Shell(ShellCompletionPopup {
+                text: self.current_text(),
+                cursor: self.current_cursor(),
+                lines: menu,
+            });
+        }
+        true
+    }
+
+    pub(crate) fn apply_shell_preview(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        preview: crate::shell_completion::ShellPreview,
+    ) -> bool {
+        if !self.config.shell_commands_enabled
+            || !text.starts_with('!')
+            || self.current_text() != text
+            || self.current_cursor() != cursor
+            || self.draft.textarea.text_element_ranges().next().is_some()
+        {
+            return false;
+        }
+        let preserved_highlights = self.shell_preview.as_ref().and_then(|state| {
+            let expected_composite = state.preserve_highlights_for.as_ref()?;
+            let line = text.strip_prefix('!')?;
+            (state.text == text
+                && state.cursor == cursor
+                && expected_composite == &format!("{line}{}", preview.suggestion))
+                .then(|| state.preview.highlights.clone())
+        });
+        let mut preview = preview;
+        if let Some(highlights) = preserved_highlights {
+            preview.highlights = highlights;
+        }
+        self.shell_preview = Some(ShellPreviewState {
+            text: text.to_string(),
+            cursor,
+            preview,
+            preserve_highlights_for: None,
+        });
+        true
+    }
+
+    fn sync_shell_preview(&mut self) {
+        let text = self.current_text();
+        let cursor = self.current_cursor();
+        if !self.config.shell_commands_enabled
+            || !text.starts_with('!')
+            || text.len() <= 1
+            || self.history_search.is_some()
+            || self.draft.textarea.vim_query().is_some()
+            || self.draft.textarea.text_element_ranges().next().is_some()
+        {
+            self.shell_preview = None;
+            self.last_shell_preview_request = None;
+            return;
+        }
+        if self.last_shell_preview_request.as_ref().is_some_and(
+            |(requested_text, requested_cursor)| {
+                requested_text == &text && *requested_cursor == cursor
+            },
+        ) {
+            return;
+        }
+        self.retain_shell_preview_while_refreshing(&text, cursor);
+        self.last_shell_preview_request = Some((text.clone(), cursor));
+        self.app_event_tx
+            .send(AppEvent::StartShellPreview { text, cursor });
+    }
+
+    fn retain_shell_preview_while_refreshing(&mut self, text: &str, cursor: usize) {
+        let Some(state) = self.shell_preview.as_mut() else {
+            return;
+        };
+        let Some(old_line) = state.text.strip_prefix('!') else {
+            return;
+        };
+        let Some(new_line) = text.strip_prefix('!') else {
+            return;
+        };
+        let common_prefix_len = old_line
+            .chars()
+            .zip(new_line.chars())
+            .take_while(|(old, new)| old == new)
+            .map(|(ch, _)| ch.len_utf8())
+            .sum::<usize>();
+        state.preview.highlights.retain_mut(|highlight| {
+            highlight.range.end = highlight.range.end.min(common_prefix_len);
+            highlight.range.start < highlight.range.end
+        });
+
+        let consumed_suggestion = (state.cursor == state.text.len() && cursor == text.len())
+            .then(|| new_line.strip_prefix(old_line))
+            .flatten()
+            .filter(|appended| !appended.is_empty())
+            .and_then(|appended| {
+                state
+                    .preview
+                    .suggestion
+                    .strip_prefix(appended)
+                    .map(str::to_string)
+            });
+        if let Some(remaining_suggestion) = consumed_suggestion {
+            // Moving a matching prefix from POSTDISPLAY into BUFFER does not change the visible
+            // line. Extend the current token style and keep the remainder so this keypress and
+            // the matching async shell response render as a single visual update.
+            if let Some(highlight) = state
+                .preview
+                .highlights
+                .iter_mut()
+                .filter(|highlight| highlight.range.end == old_line.len())
+                .max_by_key(|highlight| highlight.range.start)
+            {
+                highlight.range.end = new_line.len();
+            } else {
+                state
+                    .preview
+                    .highlights
+                    .push(crate::shell_completion::ShellHighlight {
+                        range: old_line.len()..new_line.len(),
+                        style: state.preview.suggestion_style.clone(),
+                    });
+            }
+            state.preview.suggestion = remaining_suggestion;
+            state.preserve_highlights_for = Some(format!("{new_line}{}", state.preview.suggestion));
+            state.text = text.to_string();
+            state.cursor = cursor;
+            return;
+        }
+
+        let restored_suggestion = (state.cursor == state.text.len()
+            && cursor == text.len()
+            && !state.preview.suggestion.is_empty())
+        .then(|| old_line.strip_prefix(new_line))
+        .flatten()
+        .filter(|removed| !removed.is_empty())
+        .map(|removed| format!("{removed}{}", state.preview.suggestion));
+        if let Some(restored_suggestion) = restored_suggestion {
+            // Moving a suffix from BUFFER back into POSTDISPLAY also leaves the visible line
+            // unchanged. Keep that composite on screen while the shell recomputes its preview.
+            state.preview.suggestion = restored_suggestion;
+            state.preserve_highlights_for = Some(format!("{new_line}{}", state.preview.suggestion));
+            state.text = text.to_string();
+            state.cursor = cursor;
+            return;
+        }
+
+        let extends_current_word = state.cursor == state.text.len()
+            && cursor == text.len()
+            && new_line.starts_with(old_line)
+            && new_line[old_line.len()..]
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/'));
+        if extends_current_word
+            && let Some(highlight) = state
+                .preview
+                .highlights
+                .iter_mut()
+                .filter(|highlight| highlight.range.end == old_line.len())
+                .max_by_key(|highlight| highlight.range.start)
+        {
+            highlight.range.end = new_line.len();
+        }
+        state.preview.suggestion.clear();
+        state.preview.suggestion_style.clear();
+        state.preview.accepted_highlights.clear();
+        state.preserve_highlights_for = None;
+        state.text = text.to_string();
+        state.cursor = cursor;
+    }
+
+    fn matching_shell_preview(&self) -> Option<&crate::shell_completion::ShellPreview> {
+        let state = self.shell_preview.as_ref()?;
+        (self.draft.is_bash_mode
+            && state.text == self.current_text()
+            && state.cursor == self.current_cursor())
+        .then_some(&state.preview)
+    }
+
+    fn accept_shell_suggestion(&mut self) -> bool {
+        let Some(preview) = self.matching_shell_preview() else {
+            return false;
+        };
+        if self.draft.textarea.is_vim_normal_mode()
+            || self.current_cursor() != self.current_text().len()
+            || preview.suggestion.is_empty()
+        {
+            return false;
+        }
+        let suggestion = preview.suggestion.clone();
+        let suggestion_style = preview.suggestion_style.clone();
+        let accepted_highlights = preview.accepted_highlights.clone();
+        let suggestion_start = self.draft.textarea.text().len();
+        self.draft.textarea.insert_str(&suggestion);
+        let text = self.current_text();
+        let cursor = self.current_cursor();
+        if let Some(state) = self.shell_preview.as_mut() {
+            if accepted_highlights.is_empty() {
+                state
+                    .preview
+                    .highlights
+                    .push(crate::shell_completion::ShellHighlight {
+                        range: suggestion_start..suggestion_start + suggestion.len(),
+                        style: suggestion_style,
+                    });
+            } else {
+                state.preview.highlights = accepted_highlights;
+            }
+            state.preview.suggestion.clear();
+            state.preview.suggestion_style.clear();
+            state.preview.accepted_highlights.clear();
+            state.preserve_highlights_for = None;
+            state.text = text;
+            state.cursor = cursor;
+        }
+        self.sync_popups();
+        true
+    }
+
     /// Recall content at its history boundary, preserving pending pastes and omitting images
     /// in plain-text editors.
     fn apply_history_entry(&mut self, entry: HistoryEntry) {
@@ -1955,6 +2265,10 @@ impl ChatComposer {
             return (InputResult::None, false);
         }
 
+        if key_event.code != KeyCode::Tab || key_event.modifiers != KeyModifiers::NONE {
+            self.shell_completion_generation = self.shell_completion_generation.wrapping_add(1);
+        }
+
         let before = self.before_sparkle_key(key_event);
         let result = self.handle_key_event_inner(key_event);
         self.after_sparkle_key(before, &result.0);
@@ -1990,6 +2304,7 @@ impl ChatComposer {
             ActivePopup::File(_) => self.handle_key_event_with_file_popup(key_event),
             ActivePopup::Skill(_) => self.handle_key_event_with_skill_popup(key_event),
             ActivePopup::MentionV2(_) => self.handle_key_event_with_mentions_v2_popup(key_event),
+            ActivePopup::Shell(_) => self.handle_key_event_with_shell_popup(key_event),
             ActivePopup::None => self.handle_key_event_without_popup(key_event),
         };
         self.reset_vim_mode_after_successful_dispatch(&result.0);
@@ -2102,6 +2417,16 @@ impl ChatComposer {
         self.draft.textarea.input(input);
         self.reconcile_deleted_elements(elements_before);
         (InputResult::None, true)
+    }
+
+    fn handle_key_event_with_shell_popup(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
+        if key_event.code == KeyCode::Esc
+            || key_event.code == KeyCode::Enter && key_event.modifiers == KeyModifiers::NONE
+        {
+            self.popups.active = ActivePopup::None;
+            return (InputResult::None, true);
+        }
+        self.handle_key_event_without_popup(key_event)
     }
 
     /// Handle key events when file search popup is visible.
@@ -3512,10 +3837,33 @@ impl ChatComposer {
         } else {
             self.footer.mode = reset_mode_after_activity(self.footer.mode);
         }
-        if self.queue_keys.is_pressed(key_event)
-            && (self.is_task_running || self.queue_submissions || !self.is_bang_shell_command())
-        {
+        if self.queue_keys.is_pressed(key_event) && !self.is_bang_shell_command() {
             return self.handle_submission(self.is_task_running || self.queue_submissions);
+        }
+
+        if key_event.modifiers == KeyModifiers::NONE
+            && matches!(key_event.code, KeyCode::Right | KeyCode::End)
+            && self.accept_shell_suggestion()
+        {
+            return (InputResult::None, true);
+        }
+
+        if key_event.code == KeyCode::Tab
+            && key_event.modifiers == KeyModifiers::NONE
+            && self.config.shell_commands_enabled
+            && self.current_text().starts_with('!')
+        {
+            if let Some(pasted) = self.draft.paste_burst.flush_before_modified_input() {
+                self.apply_paste(pasted);
+            }
+            if self.draft.textarea.text_element_ranges().next().is_none() {
+                self.app_event_tx.send(AppEvent::StartShellCompletion {
+                    text: self.current_text(),
+                    cursor: self.current_cursor(),
+                    generation: self.shell_completion_generation,
+                });
+            }
+            return (InputResult::None, false);
         }
 
         if self.submit_keys.is_pressed(key_event) {
@@ -3926,6 +4274,7 @@ impl ChatComposer {
 
     pub(crate) fn sync_popups(&mut self) {
         self.sync_slash_command_elements();
+        self.sync_shell_preview();
         if self.history_search.is_some() || self.draft.textarea.vim_query().is_some() {
             if self.popups.current_file_query.is_some() {
                 self.app_event_tx
@@ -3939,6 +4288,21 @@ impl ChatComposer {
         }
         if !self.popups_enabled() || self.draft.textarea.mouse_selection_range().is_some() {
             self.popups.active = ActivePopup::None;
+            return;
+        }
+        if self.config.shell_commands_enabled && self.current_text().starts_with('!') {
+            if self.popups.current_file_query.is_some() {
+                self.app_event_tx
+                    .send(AppEvent::StartFileSearch(String::new()));
+                self.popups.current_file_query = None;
+            }
+            if !matches!(&self.popups.active, ActivePopup::Shell(popup)
+                if popup.text == self.current_text() && popup.cursor == self.current_cursor())
+            {
+                self.popups.active = ActivePopup::None;
+            }
+            self.popups.dismissed_file_token = None;
+            self.popups.dismissed_mention_token = None;
             return;
         }
         let mut mentions_v2_token = self.current_mentions_v2_token_range();
@@ -4645,6 +5009,7 @@ impl ChatComposer {
                 ActivePopup::MentionV2(popup) => popup.render_ref(popup_rect, buf),
                 ActivePopup::File(popup) => popup.render_ref(popup_rect, buf),
                 ActivePopup::Skill(popup) => popup.render_ref(popup_rect, buf),
+                ActivePopup::Shell(popup) => popup.render_menu(popup_rect, buf),
                 ActivePopup::None => {
                     unreachable!("only suggestion menus use above-composer placement")
                 }
@@ -4959,7 +5324,19 @@ impl ChatComposer {
                     .textarea
                     .render_ref_masked(textarea_rect, buf, &mut state, mask_char);
             } else {
-                let mut highlights = self.plugin_at_mention_highlights();
+                let mut highlights = if self.draft.is_bash_mode {
+                    Vec::new()
+                } else {
+                    self.plugin_at_mention_highlights()
+                };
+                if let Some(shell_preview) = self.matching_shell_preview() {
+                    highlights.extend(shell_preview.highlights.iter().map(|highlight| {
+                        (
+                            highlight.range.clone(),
+                            shell_highlight_style(&highlight.style),
+                        )
+                    }));
+                }
                 let search_highlight_style =
                     Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
                 highlights.extend(
@@ -5000,6 +5377,26 @@ impl ChatComposer {
                 let placeholder = Span::from(text).dim();
                 Line::from(vec![placeholder]).render(textarea_rect.inner(Margin::new(0, 0)), buf);
             }
+        }
+        if mask_char.is_none()
+            && self.draft.textarea.cursor() == self.draft.textarea.text().len()
+            && let Some(shell_preview) = self.matching_shell_preview()
+            && !shell_preview.suggestion.is_empty()
+            && let Some((x, y)) = self
+                .draft
+                .textarea
+                .cursor_pos_with_state(textarea_rect, *state)
+            && x < textarea_rect.right()
+            && y < textarea_rect.bottom()
+        {
+            let style = shell_highlight_style(&shell_preview.suggestion_style);
+            buf.set_stringn(
+                x,
+                y,
+                &shell_preview.suggestion,
+                usize::from(textarea_rect.right() - x),
+                style,
+            );
         }
         if matches!(self.popups.active, ActivePopup::None)
             && let Some(ignition) = &self.effort_ignition
@@ -5516,6 +5913,179 @@ mod tests {
             buf[(shell_label_x as u16, footer_y)].style().fg,
             Some(Color::LightRed)
         );
+    }
+
+    #[test]
+    fn shell_highlight_starts_at_first_command_character() {
+        let (mut composer, _rx) = new_test_composer();
+        let text = "!python3 -V";
+        composer.set_text_content(text.to_string(), Vec::new(), Vec::new());
+        composer.set_current_cursor(text.len());
+        assert!(composer.apply_shell_preview(
+            text,
+            text.len(),
+            crate::shell_completion::ShellPreview {
+                suggestion: String::new(),
+                suggestion_style: String::new(),
+                highlights: vec![crate::shell_completion::ShellHighlight {
+                    range: 0..7,
+                    style: "fg=yellow".to_string(),
+                }],
+                accepted_highlights: Vec::new(),
+            },
+        ));
+
+        let area = Rect::new(0, 0, 40, 5);
+        let mut buf = Buffer::empty(area);
+        composer.render(area, &mut buf);
+        assert_eq!(buf[(2, 1)].symbol(), "p");
+        assert_eq!(buf[(2, 1)].style().fg, Some(Color::Yellow));
+        assert_eq!(buf[(8, 1)].symbol(), "3");
+        assert_eq!(buf[(8, 1)].style().fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn shell_highlight_is_retained_while_the_next_preview_loads() {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_text_content("!python".to_string(), Vec::new(), Vec::new());
+        composer.set_current_cursor("!python".len());
+        assert!(composer.apply_shell_preview(
+            "!python",
+            "!python".len(),
+            crate::shell_completion::ShellPreview {
+                suggestion: " --version".to_string(),
+                suggestion_style: "fg=8".to_string(),
+                highlights: vec![crate::shell_completion::ShellHighlight {
+                    range: 0..6,
+                    style: "fg=yellow".to_string(),
+                }],
+                accepted_highlights: Vec::new(),
+            },
+        ));
+
+        composer.draft.textarea.insert_str("3");
+        composer.sync_shell_preview();
+
+        let preview = composer
+            .matching_shell_preview()
+            .expect("old shell styles should remain visible during refresh");
+        assert_eq!(preview.highlights[0].range, 0..7);
+        assert_eq!(preview.highlights[0].style, "fg=yellow");
+        assert!(preview.suggestion.is_empty());
+    }
+
+    #[test]
+    fn typed_suggestion_prefix_updates_as_one_visual_state() {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_text_content("!py".to_string(), Vec::new(), Vec::new());
+        composer.set_current_cursor("!py".len());
+        assert!(composer.apply_shell_preview(
+            "!py",
+            "!py".len(),
+            crate::shell_completion::ShellPreview {
+                suggestion: "thon -V".to_string(),
+                suggestion_style: "fg=8".to_string(),
+                highlights: vec![crate::shell_completion::ShellHighlight {
+                    range: 0..2,
+                    style: "underline".to_string(),
+                }],
+                accepted_highlights: vec![crate::shell_completion::ShellHighlight {
+                    range: 0..9,
+                    style: "fg=yellow".to_string(),
+                }],
+            },
+        ));
+
+        composer.draft.textarea.insert_str("t");
+        composer.sync_shell_preview();
+
+        let preview = composer
+            .matching_shell_preview()
+            .expect("matching typed text should keep the pending shell preview");
+        assert_eq!(preview.suggestion, "hon -V");
+        assert_eq!(preview.suggestion_style, "fg=8");
+        assert_eq!(preview.accepted_highlights[0].range, 0..9);
+        assert_eq!(preview.highlights.len(), 1);
+        assert_eq!(preview.highlights[0].range, 0..3);
+        assert_eq!(preview.highlights[0].style, "underline");
+
+        assert!(composer.apply_shell_preview(
+            "!pyt",
+            "!pyt".len(),
+            crate::shell_completion::ShellPreview {
+                suggestion: "hon -V".to_string(),
+                suggestion_style: "fg=8".to_string(),
+                highlights: vec![crate::shell_completion::ShellHighlight {
+                    range: 0..3,
+                    style: "bold".to_string(),
+                }],
+                accepted_highlights: vec![crate::shell_completion::ShellHighlight {
+                    range: 0..9,
+                    style: "fg=yellow".to_string(),
+                }],
+            },
+        ));
+        let preview = composer
+            .matching_shell_preview()
+            .expect("same composite result should keep the atomic display style");
+        assert_eq!(preview.highlights[0].range, 0..3);
+        assert_eq!(preview.highlights[0].style, "underline");
+    }
+
+    #[test]
+    fn deleted_suggestion_prefix_updates_as_one_visual_state() {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_text_content("!pyth".to_string(), Vec::new(), Vec::new());
+        composer.set_current_cursor("!pyth".len());
+        assert!(composer.apply_shell_preview(
+            "!pyth",
+            "!pyth".len(),
+            crate::shell_completion::ShellPreview {
+                suggestion: "on -V".to_string(),
+                suggestion_style: "fg=8".to_string(),
+                highlights: vec![crate::shell_completion::ShellHighlight {
+                    range: 0..4,
+                    style: "underline".to_string(),
+                }],
+                accepted_highlights: vec![crate::shell_completion::ShellHighlight {
+                    range: 0..9,
+                    style: "fg=yellow".to_string(),
+                }],
+            },
+        ));
+
+        composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        assert_eq!(composer.current_text(), "!pyt");
+        let preview = composer
+            .matching_shell_preview()
+            .expect("backspace should keep the pending shell preview");
+        assert_eq!(preview.suggestion, "hon -V");
+        assert_eq!(preview.suggestion_style, "fg=8");
+        assert_eq!(preview.highlights[0].range, 0..3);
+        assert_eq!(preview.highlights[0].style, "underline");
+
+        assert!(composer.apply_shell_preview(
+            "!pyt",
+            "!pyt".len(),
+            crate::shell_completion::ShellPreview {
+                suggestion: "hon -V".to_string(),
+                suggestion_style: "fg=8".to_string(),
+                highlights: vec![crate::shell_completion::ShellHighlight {
+                    range: 0..3,
+                    style: "bold".to_string(),
+                }],
+                accepted_highlights: vec![crate::shell_completion::ShellHighlight {
+                    range: 0..9,
+                    style: "fg=yellow".to_string(),
+                }],
+            },
+        ));
+        let preview = composer
+            .matching_shell_preview()
+            .expect("same composite result should keep the atomic display style");
+        assert_eq!(preview.highlights[0].range, 0..3);
+        assert_eq!(preview.highlights[0].style, "underline");
     }
 
     fn plugin_mention_foreground_color(composer: &ChatComposer) -> Option<Color> {
@@ -10413,6 +10983,71 @@ mod tests {
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
 
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        composer.set_task_running(/*running*/ true);
+
+        type_chars_humanlike(&mut composer, &['!', 'l', 's']);
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert!(matches!(result, InputResult::None));
+        assert!(
+            composer.current_text().starts_with("!ls"),
+            "expected Tab not to submit or clear a `!` command"
+        );
+        let generations = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::StartShellCompletion {
+                    text,
+                    cursor,
+                    generation,
+                } if text == "!ls" && cursor == 3 => Some(generation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(generations.len(), 2);
+        assert_eq!(generations[0], generations[1]);
+
+        assert!(composer.apply_shell_completion("!ls", 3, "!ls ", 4, Vec::new()));
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let continued_generation = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|event| {
+                let AppEvent::StartShellCompletion {
+                    text, generation, ..
+                } = event
+                else {
+                    return None;
+                };
+                (text == "!ls ").then_some(generation)
+            })
+            .expect("an applied completion should continue the current Tab cycle");
+        assert_eq!(continued_generation, generations[0]);
+
+        type_chars_humanlike(&mut composer, &['x']);
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let edited_generation = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|event| {
+                let AppEvent::StartShellCompletion { generation, .. } = event else {
+                    return None;
+                };
+                Some(generation)
+            })
+            .expect("edited draft should start another shell completion");
+        assert_ne!(edited_generation, generations[0]);
+    }
+
+    #[test]
+    fn shell_completion_ignores_stale_draft_and_preserves_cursor() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let sender = AppEventSender::new(tx);
         let mut composer = ChatComposer::new(
@@ -10422,18 +11057,135 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             /*disable_paste_burst*/ false,
         );
-        composer.set_task_running(/*running*/ false);
+        composer.set_text_content("!ec".to_string(), Vec::new(), Vec::new());
+        composer.set_current_cursor(3);
 
-        type_chars_humanlike(&mut composer, &['!', 'l', 's']);
+        assert!(composer.apply_shell_completion("!ec", 3, "!echo", 5, Vec::new()));
+        assert_eq!(composer.current_text(), "!echo");
+        assert_eq!(composer.current_cursor(), 5);
+        assert!(!composer.apply_shell_completion("!ec", 3, "!exit", 5, Vec::new()));
+        assert_eq!(composer.current_text(), "!echo");
+    }
 
-        let (result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    #[test]
+    fn shell_completion_menu_survives_redraw_and_clears_on_edit() {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_text_content("!ec".to_string(), Vec::new(), Vec::new());
+        composer.set_current_cursor(3);
+        assert!(composer.apply_shell_completion(
+            "!ec",
+            3,
+            "!echo",
+            5,
+            vec![crate::shell_completion::ShellMenuLine {
+                text: "echo  echotc  echoti".to_string(),
+                selected_cells: Some(6..12),
+            }],
+        ));
+        composer.sync_popups();
+        assert!(matches!(composer.popups.active, ActivePopup::Shell(_)));
 
-        assert!(matches!(result, InputResult::None));
-        assert!(
-            composer.current_text().starts_with("!ls"),
-            "expected Tab not to submit or clear a `!` command"
+        let (result, needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(result, InputResult::None);
+        assert!(needs_redraw);
+        assert!(matches!(composer.popups.active, ActivePopup::None));
+
+        assert!(composer.apply_shell_completion(
+            "!echo",
+            5,
+            "!echo",
+            5,
+            vec![crate::shell_completion::ShellMenuLine {
+                text: "echo  echotc  echoti".to_string(),
+                selected_cells: Some(0..4),
+            }],
+        ));
+        let completion_generation = composer.shell_completion_generation;
+        let (result, needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(result, InputResult::None);
+        assert!(needs_redraw);
+        assert_eq!(composer.current_text(), "!echo");
+        assert!(matches!(composer.popups.active, ActivePopup::None));
+        assert_ne!(composer.shell_completion_generation, completion_generation);
+
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(result, InputResult::Submitted { .. }));
+
+        composer.set_text_content("!echo x".to_string(), Vec::new(), Vec::new());
+        assert!(matches!(composer.popups.active, ActivePopup::None));
+    }
+
+    #[test]
+    fn right_arrow_accepts_zsh_plugin_suggestion_for_current_line() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let mut composer = ChatComposer::new(
+            true,
+            AppEventSender::new(tx),
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
         );
+        type_chars_humanlike(&mut composer, &['!', 'e', 'c', 'h', 'o', ' ']);
+        let preview = crate::shell_completion::ShellPreview {
+            suggestion: "hello-world".to_string(),
+            suggestion_style: "fg=8".to_string(),
+            highlights: Vec::new(),
+            accepted_highlights: vec![crate::shell_completion::ShellHighlight {
+                range: 0..16,
+                style: "fg=green".to_string(),
+            }],
+        };
+        assert!(!composer.apply_shell_preview("!ec", 3, preview.clone()));
+        assert!(composer.apply_shell_preview("!echo ", 6, preview));
+
+        composer.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(composer.current_text(), "!echo hello-world");
+        let retained_preview = composer
+            .matching_shell_preview()
+            .expect("accepted suggestion style should remain while the preview refreshes");
+        assert!(retained_preview.suggestion.is_empty());
+        assert!(
+            retained_preview
+                .highlights
+                .iter()
+                .any(|highlight| highlight.range == (0..16) && highlight.style == "fg=green")
+        );
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(
+                event,
+                AppEvent::StartShellPreview { text, cursor }
+                    if text == "!echo hello-world" && cursor == text.len()
+            ))
+        );
+    }
+
+    #[test]
+    fn shell_input_does_not_open_at_file_completion() {
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        composer.set_text_content("!cat @ma".to_string(), Vec::new(), Vec::new());
+        composer.set_current_cursor("!cat @ma".len());
+        composer.sync_popups();
+
+        assert!(matches!(composer.popups.active, ActivePopup::None));
+        assert!(!matches!(
+            rx.try_recv(),
+            Ok(AppEvent::StartFileSearch(query)) if query == "ma"
+        ));
     }
 
     #[test]

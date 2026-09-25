@@ -91,7 +91,8 @@ impl super::ChatComposer {
             ActivePopup::Command(_)
             | ActivePopup::File(_)
             | ActivePopup::Skill(_)
-            | ActivePopup::MentionV2(_) => None,
+            | ActivePopup::MentionV2(_)
+            | ActivePopup::Shell(_) => None,
         }
     }
 

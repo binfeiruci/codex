@@ -1532,6 +1532,111 @@ impl App {
             AppEvent::FileSearchResult { query, matches } => {
                 self.chat_widget.apply_file_search_result(query, matches);
             }
+            AppEvent::RecordShellHistory { command, cwd } => {
+                tokio::spawn(async move {
+                    crate::shell_completion::record_shell_history(&command, &cwd).await;
+                });
+            }
+            AppEvent::StartShellCompletion {
+                text,
+                cursor,
+                generation,
+            } => {
+                if let Some(line) = text.strip_prefix('!') {
+                    let thread_id = self.active_thread_id;
+                    let cwd = if let Some(thread_id) = thread_id {
+                        self.thread_cwd(thread_id)
+                            .await
+                            .map(|cwd| cwd.to_path_buf())
+                            .unwrap_or_else(|| self.config.cwd.to_path_buf())
+                    } else {
+                        self.config.cwd.to_path_buf()
+                    };
+                    let app_event_tx = self.app_event_tx.clone();
+                    let line = line.to_string();
+                    tokio::spawn(async move {
+                        if let Some(completion) =
+                            crate::shell_completion::complete(
+                                &line,
+                                cursor.saturating_sub(1),
+                                generation,
+                                &cwd,
+                            )
+                            .await
+                        {
+                            app_event_tx.send(AppEvent::ShellCompletionResult {
+                                thread_id,
+                                text: format!("!{}", completion.source_line),
+                                cursor: completion.source_cursor + 1,
+                                completed: format!("!{}", completion.line),
+                                completed_cursor: completion.cursor + 1,
+                                menu: completion.menu,
+                            });
+                        }
+                    });
+                }
+            }
+            AppEvent::ShellCompletionResult {
+                thread_id,
+                text,
+                cursor,
+                completed,
+                completed_cursor,
+                menu,
+            } => {
+                if thread_id == self.active_thread_id {
+                    self.chat_widget.apply_shell_completion(
+                        &text,
+                        cursor,
+                        &completed,
+                        completed_cursor,
+                        menu,
+                    );
+                }
+            }
+            AppEvent::StartShellPreview { text, cursor } => {
+                if let Some(line) = text.strip_prefix('!') {
+                    let thread_id = self.active_thread_id;
+                    let cwd = if let Some(thread_id) = thread_id {
+                        self.thread_cwd(thread_id)
+                            .await
+                            .map(|cwd| cwd.to_path_buf())
+                            .unwrap_or_else(|| self.config.cwd.to_path_buf())
+                    } else {
+                        self.config.cwd.to_path_buf()
+                    };
+                    let app_event_tx = self.app_event_tx.clone();
+                    let line = line.to_string();
+                    let generation = crate::shell_completion::next_preview_generation();
+                    tokio::spawn(async move {
+                        if let Some(preview) = crate::shell_completion::preview(
+                            &line,
+                            cursor.saturating_sub(1),
+                            &cwd,
+                            generation,
+                        )
+                        .await
+                        {
+                            app_event_tx.send(AppEvent::ShellPreviewResult {
+                                thread_id,
+                                text,
+                                cursor,
+                                preview,
+                            });
+                        }
+                    });
+                }
+            }
+            AppEvent::ShellPreviewResult {
+                thread_id,
+                text,
+                cursor,
+                preview,
+            } => {
+                if thread_id == self.active_thread_id {
+                    self.chat_widget.apply_shell_preview(&text, cursor, preview);
+                }
+            }
             AppEvent::TaskSearchResult {
                 thread_id,
                 query,

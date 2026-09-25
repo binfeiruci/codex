@@ -72,6 +72,7 @@ codex-utils-elapsed = { workspace = true }
 codex-utils-fuzzy-match = { workspace = true }
 codex-utils-home-dir = { workspace = true }
 codex-utils-oss = { workspace = true }
+codex-utils-pty = { workspace = true }
 codex-utils-path = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 codex-utils-plugins = { workspace = true }
@@ -133,6 +134,7 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 webbrowser = { workspace = true }
 uuid = { workspace = true }
+vt100 = { workspace = true }
 
 codex-windows-sandbox = { workspace = true }
 tokio-util = { workspace = true, features = ["time"] }
@@ -185,6 +187,5 @@ pretty_assertions = { workspace = true }
 rand = { workspace = true }
 serial_test = { workspace = true }
 tokio-tungstenite = { workspace = true }
-vt100 = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }

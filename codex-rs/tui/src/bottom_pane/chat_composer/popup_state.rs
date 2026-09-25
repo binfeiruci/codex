@@ -6,6 +6,13 @@ use crate::bottom_pane::file_search_popup::FileSearchPopup;
 use crate::bottom_pane::mentions_v2::MentionV2Popup;
 use crate::bottom_pane::skill_popup::SkillPopup;
 use crate::bottom_pane::textarea::TextArea;
+use crate::shell_completion::ShellMenuLine;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::widgets::Block;
+use ratatui::widgets::Borders;
+use ratatui::widgets::Paragraph;
+use ratatui::widgets::Widget;
 use std::ops::Range;
 
 /// One token occurrence whose autocomplete popup should remain hidden.
@@ -110,6 +117,48 @@ pub(super) enum ActivePopup {
     File(FileSearchPopup),
     Skill(SkillPopup),
     MentionV2(MentionV2Popup),
+    Shell(ShellCompletionPopup),
+}
+
+/// Lines drawn by the user's shell after an ambiguous Tab completion.
+pub(super) struct ShellCompletionPopup {
+    pub(super) text: String,
+    pub(super) cursor: usize,
+    pub(super) lines: Vec<ShellMenuLine>,
+}
+
+impl ShellCompletionPopup {
+    pub(super) fn render_menu(&self, area: Rect, buffer: &mut Buffer) {
+        let content = self
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Paragraph::new(content)
+            .block(
+                Block::default()
+                    .title("Shell completions")
+                    .borders(Borders::ALL),
+            )
+            .render(area, buffer);
+
+        let selected_style = crate::style::selection_style();
+        let content_width = usize::from(area.width.saturating_sub(2));
+        let content_height = usize::from(area.height.saturating_sub(2));
+        for (row, line) in self.lines.iter().take(content_height).enumerate() {
+            if let Some(range) = &line.selected_cells {
+                for col in range.start.min(content_width)..range.end.min(content_width) {
+                    if let Some(cell) = buffer.cell_mut((
+                        area.x.saturating_add(1).saturating_add(col as u16),
+                        area.y.saturating_add(1).saturating_add(row as u16),
+                    )) {
+                        cell.set_style(selected_style);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl ActivePopup {
@@ -125,6 +174,7 @@ impl ActivePopup {
             Self::File(popup) => popup.calculate_required_height() + footer_total_height,
             Self::Skill(popup) => popup.calculate_required_height(width) + footer_total_height,
             Self::MentionV2(popup) => popup.calculate_required_height(width) + footer_total_height,
+            Self::Shell(popup) => popup.lines.len().min(8) as u16 + 2 + footer_total_height,
         }
     }
 }

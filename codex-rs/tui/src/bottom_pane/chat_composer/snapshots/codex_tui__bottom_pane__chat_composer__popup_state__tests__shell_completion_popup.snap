@@ -1,0 +1,7 @@
+---
+source: tui/src/bottom_pane/chat_composer/popup_state_tests.rs
+expression: terminal.backend()
+---
+"┌Shell completions─────────────────────┐"
+"│echo  echotc  echoti                  │"
+"└──────────────────────────────────────┘"

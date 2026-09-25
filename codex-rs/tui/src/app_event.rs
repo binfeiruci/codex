@@ -644,6 +644,42 @@ pub(crate) enum AppEvent {
         matches: Vec<FileMatch>,
     },
 
+    /// Persist an accepted `!` command through the user's interactive shell history mechanism.
+    RecordShellHistory {
+        command: String,
+        cwd: PathBuf,
+    },
+
+    /// Ask the local interactive shell to complete a `!` command.
+    StartShellCompletion {
+        text: String,
+        cursor: usize,
+        generation: u64,
+    },
+
+    /// An asynchronous shell completion result for the draft that requested it.
+    ShellCompletionResult {
+        thread_id: Option<ThreadId>,
+        text: String,
+        cursor: usize,
+        completed: String,
+        completed_cursor: usize,
+        menu: Vec<crate::shell_completion::ShellMenuLine>,
+    },
+
+    /// Refresh zsh plugin suggestions and syntax highlighting for a `!` line.
+    StartShellPreview {
+        text: String,
+        cursor: usize,
+    },
+
+    ShellPreviewResult {
+        thread_id: Option<ThreadId>,
+        text: String,
+        cursor: usize,
+        preview: crate::shell_completion::ShellPreview,
+    },
+
     /// Same-host task results for the active unified mention query.
     TaskSearchResult {
         thread_id: ThreadId,

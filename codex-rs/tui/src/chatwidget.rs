@@ -1666,6 +1666,27 @@ impl ChatWidget {
         self.bottom_pane.on_file_search_result(query, matches);
     }
 
+    pub(crate) fn apply_shell_completion(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        completed: &str,
+        completed_cursor: usize,
+        menu: Vec<crate::shell_completion::ShellMenuLine>,
+    ) {
+        self.bottom_pane
+            .apply_shell_completion(text, cursor, completed, completed_cursor, menu);
+    }
+
+    pub(crate) fn apply_shell_preview(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        preview: crate::shell_completion::ShellPreview,
+    ) {
+        self.bottom_pane.apply_shell_preview(text, cursor, preview);
+    }
+
     /// Return the markdown body width available to an active stream.
     ///
     /// Streaming controllers render only the message body, while history cells add bullets,

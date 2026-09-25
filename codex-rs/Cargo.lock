@@ -4725,6 +4725,7 @@ dependencies = [
  "codex-utils-fuzzy-match",
  "codex-utils-home-dir",
  "codex-utils-oss",
+ "codex-utils-pty",
  "codex-utils-path",
  "codex-utils-path-uri",
  "codex-utils-plugins",
