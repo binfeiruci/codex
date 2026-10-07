@@ -1,0 +1,5 @@
+---
+source: tui/src/bottom_pane/chat_composer/popup_state_tests.rs
+expression: selected_cells
+---
+......######..........................

@@ -252,7 +252,11 @@ async fn queued_bang_shell_dispatches_after_active_turn() {
     chat.thread_id = Some(ThreadId::new());
     handle_turn_started(&mut chat, "turn-1");
 
-    queue_composer_text_with_tab(&mut chat, "!echo hi");
+    assert!(chat.queue_user_message_with_options(
+        "!echo hi".into(),
+        QueuedInputAction::RunShell,
+        Vec::new(),
+    ));
 
     assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
     assert_eq!(
@@ -281,7 +285,11 @@ async fn queued_empty_bang_shell_reports_help_when_dequeued_and_drains_next_inpu
     chat.thread_id = Some(ThreadId::new());
     handle_turn_started(&mut chat, "turn-1");
 
-    queue_composer_text_with_tab(&mut chat, "!");
+    assert!(chat.queue_user_message_with_options(
+        "!".into(),
+        QueuedInputAction::RunShell,
+        Vec::new(),
+    ));
     queue_composer_text_with_tab(&mut chat, "hello after help");
 
     assert!(drain_insert_history(&mut rx).is_empty());
@@ -318,7 +326,11 @@ async fn queued_bang_shell_waits_for_user_shell_completion_before_next_input() {
     chat.thread_id = Some(ThreadId::new());
     handle_turn_started(&mut chat, "turn-1");
 
-    queue_composer_text_with_tab(&mut chat, "!echo hi");
+    assert!(chat.queue_user_message_with_options(
+        "!echo hi".into(),
+        QueuedInputAction::RunShell,
+        Vec::new(),
+    ));
     queue_composer_text_with_tab(&mut chat, "hello after shell");
 
     complete_turn_with_message(&mut chat, "turn-1", Some("done"));
